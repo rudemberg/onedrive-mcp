@@ -9,6 +9,17 @@ import {
 const app = express();
 app.use(express.json());
 
+// Liberação de CORS para permitir a conexão do Gemini
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(200);
+  }
+  next();
+});
+
 const CLIENT_ID = process.env.CLIENT_ID;
 const CLIENT_SECRET = process.env.CLIENT_SECRET;
 const REDIRECT_URI = process.env.REDIRECT_URI;
@@ -22,14 +33,15 @@ async function getAccessToken() {
   if (currentAccessToken && Date.now() < tokenExpiresAt - 60000) {
     return currentAccessToken;
   }
-  if (!REFRESH_TOKEN) {
+  const tokenToUse = process.env.REFRESH_TOKEN || REFRESH_TOKEN;
+  if (!tokenToUse) {
     throw new Error("OneDrive não autorizado. Acesse a rota /auth no navegador para autenticar.");
   }
   const params = new URLSearchParams({
     client_id: CLIENT_ID,
     client_secret: CLIENT_SECRET,
     grant_type: "refresh_token",
-    refresh_token: REFRESH_TOKEN,
+    refresh_token: tokenToUse,
   });
 
   const response = await fetch("https://login.microsoftonline.com/common/oauth2/v2.0/token", {
@@ -100,114 +112,119 @@ app.get("/callback", async (req, res) => {
   }
 });
 
-// Configuração do Servidor MCP
-const server = new Server(
-  { name: "onedrive-mcp", version: "1.0.0" },
-  { capabilities: { tools: {} } }
-);
+// Fábrica do servidor MCP por sessão
+function setupMcpServer() {
+  const server = new Server(
+    { name: "onedrive-mcp", version: "1.0.0" },
+    { capabilities: { tools: {} } }
+  );
 
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return {
-    tools: [
-      {
-        name: "onedrive_list_files",
-        description: "Lista arquivos e pastas no seu OneDrive.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            folder_path: { type: "string", description: "Caminho da pasta (opcional, vazio para a raiz)" },
+  server.setRequestHandler(ListToolsRequestSchema, async () => {
+    return {
+      tools: [
+        {
+          name: "onedrive_list_files",
+          description: "Lista arquivos e pastas no seu OneDrive.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              folder_path: { type: "string", description: "Caminho da pasta (opcional, vazio para a raiz)" },
+            },
           },
         },
-      },
-      {
-        name: "onedrive_search_files",
-        description: "Pesquisa arquivos por palavra-chave no OneDrive.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            query: { type: "string", description: "Termo de busca" },
+        {
+          name: "onedrive_search_files",
+          description: "Pesquisa arquivos por palavra-chave no OneDrive.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              query: { type: "string", description: "Termo de busca" },
+            },
+            required: ["query"],
           },
-          required: ["query"],
         },
-      },
-      {
-        name: "onedrive_read_file",
-        description: "Lê o conteúdo em texto de um arquivo no OneDrive.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            item_id: { type: "string", description: "ID do item/arquivo retornado pela listagem ou busca" },
+        {
+          name: "onedrive_read_file",
+          description: "Lê o conteúdo em texto de um arquivo no OneDrive.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              item_id: { type: "string", description: "ID do item/arquivo retornado pela listagem ou busca" },
+            },
+            required: ["item_id"],
           },
-          required: ["item_id"],
         },
-      },
-      {
-        name: "onedrive_upload_file",
-        description: "Cria ou atualiza um arquivo de texto no OneDrive.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            file_path: { type: "string", description: "Caminho e nome do arquivo (ex: 'Notas/resumo.txt')" },
-            content: { type: "string", description: "Conteúdo em texto a ser salvo" },
+        {
+          name: "onedrive_upload_file",
+          description: "Cria ou atualiza um arquivo de texto no OneDrive.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              file_path: { type: "string", description: "Caminho e nome do arquivo (ex: 'Notas/resumo.txt')" },
+              content: { type: "string", description: "Conteúdo em texto a ser salvo" },
+            },
+            required: ["file_path", "content"],
           },
-          required: ["file_path", "content"],
         },
-      },
-    ],
-  };
-});
+      ],
+    };
+  });
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const token = await getAccessToken();
-  const { name, arguments: args } = request.params;
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const token = await getAccessToken();
+    const { name, arguments: args } = request.params;
 
-  if (name === "onedrive_list_files") {
-    const path = args?.folder_path ? `root:/${encodeURIComponent(args.folder_path)}:/children` : "root/children";
-    const res = await fetch(`https://graph.microsoft.com/v1.0/me/drive/${path}`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    const data = await res.json();
-    return { content: [{ type: "text", text: JSON.stringify(data.value || data, null, 2) }] };
-  }
+    if (name === "onedrive_list_files") {
+      const path = args?.folder_path ? `root:/${encodeURIComponent(args.folder_path)}:/children` : "root/children";
+      const res = await fetch(`https://graph.microsoft.com/v1.0/me/drive/${path}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await res.json();
+      return { content: [{ type: "text", text: JSON.stringify(data.value || data, null, 2) }] };
+    }
 
-  if (name === "onedrive_search_files") {
-    const res = await fetch(`https://graph.microsoft.com/v1.0/me/drive/root/search(q='${encodeURIComponent(args.query)}')`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    const data = await res.json();
-    return { content: [{ type: "text", text: JSON.stringify(data.value || data, null, 2) }] };
-  }
+    if (name === "onedrive_search_files") {
+      const res = await fetch(`https://graph.microsoft.com/v1.0/me/drive/root/search(q='${encodeURIComponent(args.query)}')`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await res.json();
+      return { content: [{ type: "text", text: JSON.stringify(data.value || data, null, 2) }] };
+    }
 
-  if (name === "onedrive_read_file") {
-    const res = await fetch(`https://graph.microsoft.com/v1.0/me/drive/items/${args.item_id}/content`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    const text = await res.text();
-    return { content: [{ type: "text", text }] };
-  }
+    if (name === "onedrive_read_file") {
+      const res = await fetch(`https://graph.microsoft.com/v1.0/me/drive/items/${args.item_id}/content`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const text = await res.text();
+      return { content: [{ type: "text", text }] };
+    }
 
-  if (name === "onedrive_upload_file") {
-    const res = await fetch(`https://graph.microsoft.com/v1.0/me/drive/root:/${encodeURIComponent(args.file_path)}:/content`, {
-      method: "PUT",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "text/plain",
-      },
-      body: args.content,
-    });
-    const data = await res.json();
-    return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
-  }
+    if (name === "onedrive_upload_file") {
+      const res = await fetch(`https://graph.microsoft.com/v1.0/me/drive/root:/${encodeURIComponent(args.file_path)}:/content`, {
+        method: "PUT",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "text/plain",
+        },
+        body: args.content,
+      });
+      const data = await res.json();
+      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    }
 
-  throw new Error(`Ferramenta desconhecida: ${name}`);
-});
+    throw new Error(`Ferramenta desconhecida: ${name}`);
+  });
 
-// Endpoints SSE para comunicação com o Gemini
+  return server;
+}
+
+// Endpoints SSE
 const transports = new Map();
 
 app.get("/sse", async (req, res) => {
   const transport = new SSEServerTransport("/messages", res);
   transports.set(transport.sessionId, transport);
+  const server = setupMcpServer();
   await server.connect(transport);
   req.on("close", () => transports.delete(transport.sessionId));
 });
@@ -219,7 +236,7 @@ app.post("/messages", async (req, res) => {
   await transport.handlePostMessage(req, res);
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`Servidor OneDrive MCP rodando na porta ${PORT}`);
 });
