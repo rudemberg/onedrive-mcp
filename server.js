@@ -9,7 +9,7 @@ import {
 const app = express();
 app.use(express.json());
 
-// Log de requisições no painel do Render
+// Log de requisições
 app.use((req, res, next) => {
   console.log(`[REQUISIÇÃO] ${req.method} ${req.url}`);
   next();
@@ -18,7 +18,7 @@ app.use((req, res, next) => {
 // Liberação completa de CORS para o Gemini
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.header("Access-Control-Allow-Methods", "GET, POST, HEAD, OPTIONS");
   res.header("Access-Control-Allow-Headers", "*");
   if (req.method === "OPTIONS") {
     return res.sendStatus(200);
@@ -26,9 +26,9 @@ app.use((req, res, next) => {
   next();
 });
 
-// Resposta na raiz para verificação de saúde do serviço
-app.get("/", (req, res) => {
-  res.send("Servidor OneDrive MCP ativo!");
+// Resposta rápida para checagem na raiz
+app.all("/", (req, res) => {
+  res.status(200).send("Servidor OneDrive MCP ativo!");
 });
 
 const CLIENT_ID = process.env.CLIENT_ID;
@@ -230,10 +230,15 @@ function setupMcpServer() {
 const transports = new Map();
 
 app.get("/sse", async (req, res) => {
-  // Evita que proxies do Render retenham os pacotes
+  // Responde imediatamente ao teste de verificação (HEAD) do Gemini
+  if (req.method === "HEAD") {
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    return res.status(200).end();
+  }
+
   res.setHeader("X-Accel-Buffering", "no");
 
-  // Envia a URL absoluta para o Gemini
   const fullMessagesUrl = "https://onedrive-mcp-p2pe.onrender.com/messages";
   const transport = new SSEServerTransport(fullMessagesUrl, res);
   transports.set(transport.sessionId, transport);
