@@ -9,15 +9,26 @@ import {
 const app = express();
 app.use(express.json());
 
-// Liberação de CORS para permitir a conexão do Gemini
+// Log de requisições no painel do Render
+app.use((req, res, next) => {
+  console.log(`[REQUISIÇÃO] ${req.method} ${req.url}`);
+  next();
+});
+
+// Liberação completa de CORS para o Gemini
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.header("Access-Control-Allow-Headers", "*");
   if (req.method === "OPTIONS") {
     return res.sendStatus(200);
   }
   next();
+});
+
+// Resposta na raiz para verificação de saúde do serviço
+app.get("/", (req, res) => {
+  res.send("Servidor OneDrive MCP ativo!");
 });
 
 const CLIENT_ID = process.env.CLIENT_ID;
@@ -28,14 +39,14 @@ let REFRESH_TOKEN = process.env.REFRESH_TOKEN || null;
 let currentAccessToken = null;
 let tokenExpiresAt = 0;
 
-// Renovação automática de Token
+// Renovação de Token Microsoft
 async function getAccessToken() {
   if (currentAccessToken && Date.now() < tokenExpiresAt - 60000) {
     return currentAccessToken;
   }
   const tokenToUse = process.env.REFRESH_TOKEN || REFRESH_TOKEN;
   if (!tokenToUse) {
-    throw new Error("OneDrive não autorizado. Acesse a rota /auth no navegador para autenticar.");
+    throw new Error("OneDrive não autorizado. Acesse /auth para autorizar.");
   }
   const params = new URLSearchParams({
     client_id: CLIENT_ID,
@@ -63,7 +74,7 @@ async function getAccessToken() {
   return currentAccessToken;
 }
 
-// Rotas de Autenticação inicial (OAuth)
+// Rotas de Autorização
 app.get("/auth", (req, res) => {
   const authUrl = `https://login.microsoftonline.com/common/oauth2/v2.0/authorize?client_id=${CLIENT_ID}&response_type=code&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&response_mode=query&scope=offline_access%20Files.ReadWrite%20User.Read`;
   res.redirect(authUrl);
@@ -101,9 +112,6 @@ app.get("/callback", async (req, res) => {
       <html>
         <body style="font-family: sans-serif; text-align: center; padding: 40px;">
           <h2 style="color: #2e7d32;">OneDrive conectado com sucesso!</h2>
-          <p>O servidor já está autorizado a acessar seus arquivos.</p>
-          <p>Copie este Refresh Token para salvar nas variáveis do Render:</p>
-          <textarea style="width: 80%; height: 100px; font-size: 11px;">${REFRESH_TOKEN}</textarea>
         </body>
       </html>
     `);
@@ -112,7 +120,7 @@ app.get("/callback", async (req, res) => {
   }
 });
 
-// Fábrica do servidor MCP por sessão
+// Ferramentas MCP
 function setupMcpServer() {
   const server = new Server(
     { name: "onedrive-mcp", version: "1.0.0" },
@@ -128,7 +136,7 @@ function setupMcpServer() {
           inputSchema: {
             type: "object",
             properties: {
-              folder_path: { type: "string", description: "Caminho da pasta (opcional, vazio para a raiz)" },
+              folder_path: { type: "string", description: "Caminho da pasta (opcional, vazio para raiz)" },
             },
           },
         },
@@ -149,7 +157,7 @@ function setupMcpServer() {
           inputSchema: {
             type: "object",
             properties: {
-              item_id: { type: "string", description: "ID do item/arquivo retornado pela listagem ou busca" },
+              item_id: { type: "string", description: "ID do item/arquivo" },
             },
             required: ["item_id"],
           },
@@ -160,7 +168,7 @@ function setupMcpServer() {
           inputSchema: {
             type: "object",
             properties: {
-              file_path: { type: "string", description: "Caminho e nome do arquivo (ex: 'Notas/resumo.txt')" },
+              file_path: { type: "string", description: "Caminho e nome do arquivo (ex: 'resumo.txt')" },
               content: { type: "string", description: "Conteúdo em texto a ser salvo" },
             },
             required: ["file_path", "content"],
@@ -218,21 +226,36 @@ function setupMcpServer() {
   return server;
 }
 
-// Endpoints SSE
+// Conexão SSE
 const transports = new Map();
 
 app.get("/sse", async (req, res) => {
-  const transport = new SSEServerTransport("/messages", res);
+  // Evita que proxies do Render retenham os pacotes
+  res.setHeader("X-Accel-Buffering", "no");
+
+  // Envia a URL absoluta para o Gemini
+  const fullMessagesUrl = "https://onedrive-mcp-p2pe.onrender.com/messages";
+  const transport = new SSEServerTransport(fullMessagesUrl, res);
   transports.set(transport.sessionId, transport);
+
   const server = setupMcpServer();
   await server.connect(transport);
-  req.on("close", () => transports.delete(transport.sessionId));
+
+  console.log(`[MCP] Cliente conectado ao SSE. Sessão: ${transport.sessionId}`);
+
+  req.on("close", () => {
+    console.log(`[MCP] Conexão SSE encerrada: ${transport.sessionId}`);
+    transports.delete(transport.sessionId);
+  });
 });
 
 app.post("/messages", async (req, res) => {
   const sessionId = req.query.sessionId;
   const transport = transports.get(sessionId);
-  if (!transport) return res.status(404).send("Sessão não encontrada.");
+  if (!transport) {
+    console.log(`[MCP] Sessão não encontrada: ${sessionId}`);
+    return res.status(404).send("Sessão não encontrada.");
+  }
   await transport.handlePostMessage(req, res);
 });
 
