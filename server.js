@@ -9,13 +9,13 @@ import {
 const app = express();
 app.use(express.json());
 
-// Log de requisições no painel do Render
+// Log de requisições
 app.use((req, res, next) => {
   console.log(`[REQUISIÇÃO] ${req.method} ${req.url}`);
   next();
 });
 
-// Liberação completa de CORS para o Gemini
+// Liberação completa de CORS
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET, POST, HEAD, OPTIONS");
@@ -145,13 +145,38 @@ const TOOLS = [
   },
   {
     name: "onedrive_read_file",
-    description: "Lê o conteúdo em texto de um arquivo no OneDrive.",
+    description: "Lê o conteúdo em texto de um único arquivo no OneDrive.",
     inputSchema: {
       type: "object",
       properties: {
         item_id: { type: "string", description: "ID do item/arquivo" },
       },
       required: ["item_id"],
+    },
+  },
+  {
+    name: "onedrive_read_multiple_files",
+    description: "Lê o conteúdo de múltiplos arquivos de uma só vez a partir de uma lista de IDs. Sempre prefira esta ferramenta quando precisar ler mais de um arquivo para reduzir confirmações.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        item_ids: {
+          type: "array",
+          items: { type: "string" },
+          description: "Lista de IDs dos arquivos para ler em lote",
+        },
+      },
+      required: ["item_ids"],
+    },
+  },
+  {
+    name: "onedrive_read_folder_files",
+    description: "Lê o conteúdo de todos os arquivos de uma pasta de uma só vez em uma única chamada.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        folder_path: { type: "string", description: "Caminho da pasta (opcional, vazio para a raiz)" },
+      },
     },
   },
   {
@@ -197,128 +222,15 @@ async function executeTool(name, args) {
     return { content: [{ type: "text", text }] };
   }
 
-  if (name === "onedrive_upload_file") {
-    const res = await fetch(`https://graph.microsoft.com/v1.0/me/drive/root:/${encodeURIComponent(args.file_path)}:/content`, {
-      method: "PUT",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "text/plain",
-      },
-      body: args.content,
-    });
-    const data = await res.json();
-    return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
-  }
-
-  throw new Error(`Ferramenta desconhecida: ${name}`);
-}
-
-// Configuração do Servidor MCP SDK
-function setupMcpServer() {
-  const server = new Server(
-    { name: "onedrive-mcp", version: "1.0.0" },
-    { capabilities: { tools: {} } }
-  );
-
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
-  server.setRequestHandler(CallToolRequestSchema, async (req) => {
-    return await executeTool(req.params.name, req.params.arguments);
-  });
-
-  return server;
-}
-
-const transports = new Map();
-let latestTransport = null;
-
-// Rota GET /sse
-app.get("/sse", async (req, res) => {
-  if (req.method === "HEAD") {
-    res.setHeader("Content-Type", "text/event-stream");
-    res.setHeader("Cache-Control", "no-cache");
-    return res.status(200).end();
-  }
-
-  res.setHeader("X-Accel-Buffering", "no");
-  const fullMessagesUrl = "https://onedrive-mcp-p2pe.onrender.com/messages";
-  const transport = new SSEServerTransport(fullMessagesUrl, res);
-  transports.set(transport.sessionId, transport);
-  latestTransport = transport;
-
-  const server = setupMcpServer();
-  await server.connect(transport);
-
-  console.log(`[MCP] Conexão SSE aberta: ${transport.sessionId}`);
-
-  req.on("close", () => {
-    console.log(`[MCP] Conexão SSE encerrada: ${transport.sessionId}`);
-    transports.delete(transport.sessionId);
-    if (latestTransport === transport) latestTransport = null;
-  });
-});
-
-// Responde a requisições POST tanto em /sse quanto em /messages
-app.post(["/sse", "/messages"], async (req, res) => {
-  const msg = req.body;
-  const sessionId = req.query.sessionId;
-  const transport = sessionId ? transports.get(sessionId) : latestTransport;
-
-  // Se houver transporte SSE ativo com essa sessão, delega a ele
-  if (transport && sessionId) {
-    return await transport.handlePostMessage(req, res);
-  }
-
-  // Resposta direta a JSON-RPC (Protocolo direto do Gemini)
-  if (msg) {
-    if (msg.method === "initialize") {
-      console.log("[MCP] Respondendo initialize do Gemini");
-      return res.json({
-        jsonrpc: "2.0",
-        id: msg.id,
-        result: {
-          protocolVersion: "2024-11-05",
-          capabilities: { tools: {} },
-          serverInfo: { name: "onedrive-mcp", version: "1.0.0" },
-        },
-      });
-    }
-
-    if (msg.method === "notifications/initialized") {
-      return res.status(200).end();
-    }
-
-    if (msg.method === "tools/list") {
-      console.log("[MCP] Enviando lista de ferramentas para o Gemini");
-      return res.json({
-        jsonrpc: "2.0",
-        id: msg.id,
-        result: { tools: TOOLS },
-      });
-    }
-
-    if (msg.method === "tools/call") {
-      console.log(`[MCP] Executando ferramenta: ${msg.params?.name}`);
-      try {
-        const result = await executeTool(msg.params.name, msg.params.arguments);
-        return res.json({ jsonrpc: "2.0", id: msg.id, result });
-      } catch (err) {
-        return res.json({
-          jsonrpc: "2.0",
-          id: msg.id,
-          error: { code: -32000, message: err.message },
-        });
-      }
-    }
-
-    if (msg.method === "ping") {
-      return res.json({ jsonrpc: "2.0", id: msg.id, result: {} });
-    }
-  }
-
-  res.status(200).end();
-});
-
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log(`Servidor OneDrive MCP rodando na porta ${PORT}`);
-});
+  // Leitura em lote de múltiplos arquivos por ID
+  if (name === "onedrive_read_multiple_files") {
+    const filesData = await Promise.all(
+      (args.item_ids || []).map(async (id) => {
+        try {
+          const res = await fetch(`https://graph.microsoft.com/v1.0/me/drive/items/${id}/content`, {
+            headers: { Authorization: `Bearer ${token}` },
+          });
+          const text = await res.text();
+          return { item_id: id, content: text };
+        } catch (err) {
+          return { item_id: id,
