@@ -233,4 +233,155 @@ async function executeTool(name, args) {
           const text = await res.text();
           return { item_id: id, content: text };
         } catch (err) {
-          return { item_id: id,
+          return { item_id: id, error: err.message };
+        }
+      })
+    );
+    return { content: [{ type: "text", text: JSON.stringify(filesData, null, 2) }] };
+  }
+
+  // Leitura direta de todos os arquivos de uma pasta
+  if (name === "onedrive_read_folder_files") {
+    const path = args?.folder_path ? `root:/${encodeURIComponent(args.folder_path)}:/children` : "root/children";
+    const listRes = await fetch(`https://graph.microsoft.com/v1.0/me/drive/${path}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const listData = await listRes.json();
+    const files = (listData.value || []).filter((item) => item.file);
+
+    const filesContent = await Promise.all(
+      files.map(async (f) => {
+        try {
+          const contentRes = await fetch(`https://graph.microsoft.com/v1.0/me/drive/items/${f.id}/content`, {
+            headers: { Authorization: `Bearer ${token}` },
+          });
+          const text = await contentRes.text();
+          return { id: f.id, name: f.name, content: text };
+        } catch (err) {
+          return { id: f.id, name: f.name, error: err.message };
+        }
+      })
+    );
+    return { content: [{ type: "text", text: JSON.stringify(filesContent, null, 2) }] };
+  }
+
+  if (name === "onedrive_upload_file") {
+    const res = await fetch(`https://graph.microsoft.com/v1.0/me/drive/root:/${encodeURIComponent(args.file_path)}:/content`, {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "text/plain",
+      },
+      body: args.content,
+    });
+    const data = await res.json();
+    return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+  }
+
+  throw new Error(`Ferramenta desconhecida: ${name}`);
+}
+
+// Configuração do Servidor MCP SDK
+function setupMcpServer() {
+  const server = new Server(
+    { name: "onedrive-mcp", version: "1.0.0" },
+    { capabilities: { tools: {} } }
+  );
+
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
+  server.setRequestHandler(CallToolRequestSchema, async (req) => {
+    return await executeTool(req.params.name, req.params.arguments);
+  });
+
+  return server;
+}
+
+const transports = new Map();
+let latestTransport = null;
+
+// Rota GET /sse
+app.get("/sse", async (req, res) => {
+  if (req.method === "HEAD") {
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    return res.status(200).end();
+  }
+
+  res.setHeader("X-Accel-Buffering", "no");
+  const fullMessagesUrl = "https://onedrive-mcp-p2pe.onrender.com/messages";
+  const transport = new SSEServerTransport(fullMessagesUrl, res);
+  transports.set(transport.sessionId, transport);
+  latestTransport = transport;
+
+  const server = setupMcpServer();
+  await server.connect(transport);
+
+  console.log(`[MCP] Conexão SSE aberta: ${transport.sessionId}`);
+
+  req.on("close", () => {
+    console.log(`[MCP] Conexão SSE encerrada: ${transport.sessionId}`);
+    transports.delete(transport.sessionId);
+    if (latestTransport === transport) latestTransport = null;
+  });
+});
+
+// Responde a requisições POST
+app.post(["/sse", "/messages"], async (req, res) => {
+  const msg = req.body;
+  const sessionId = req.query.sessionId;
+  const transport = sessionId ? transports.get(sessionId) : latestTransport;
+
+  if (transport && sessionId) {
+    return await transport.handlePostMessage(req, res);
+  }
+
+  if (msg) {
+    if (msg.method === "initialize") {
+      return res.json({
+        jsonrpc: "2.0",
+        id: msg.id,
+        result: {
+          protocolVersion: "2024-11-05",
+          capabilities: { tools: {} },
+          serverInfo: { name: "onedrive-mcp", version: "1.0.0" },
+        },
+      });
+    }
+
+    if (msg.method === "notifications/initialized") {
+      return res.status(200).end();
+    }
+
+    if (msg.method === "tools/list") {
+      return res.json({
+        jsonrpc: "2.0",
+        id: msg.id,
+        result: { tools: TOOLS },
+      });
+    }
+
+    if (msg.method === "tools/call") {
+      try {
+        const result = await executeTool(msg.params.name, msg.params.arguments);
+        return res.json({ jsonrpc: "2.0", id: msg.id, result });
+      } catch (err) {
+        return res.json({
+          jsonrpc: "2.0",
+          id: msg.id,
+          error: { code: -32000, message: err.message },
+        });
+      }
+    }
+
+    if (msg.method === "ping") {
+      return res.json({ jsonrpc: "2.0", id: msg.id, result: {} });
+    }
+  }
+
+  res.status(200).end();
+});
+
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => {
+  console.log(`Servidor OneDrive MCP rodando na porta ${PORT}`);
+});
